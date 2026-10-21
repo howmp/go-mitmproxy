@@ -485,7 +485,10 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 	peek, err := peekWithin(wc, 3, sniffWindow)
 	if err == errPeekTimeout {
 		// 服务端先发言：不能等客户端。直接拨上游并透传，否则 NULL 探针看不到 banner。
-		conn, derr := proxy.attacker.httpsDial(req.Context(), req)
+		// 这里必须用脱钩的 ctx：CONNECT handler 一返回，req.Context() 就被取消。
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(req.Context()), 10*time.Second)
+		conn, derr := proxy.attacker.httpsDial(dctx, req)
+		dcancel()
 		if derr != nil {
 			cconn.Close()
 			log.Error(derr)
