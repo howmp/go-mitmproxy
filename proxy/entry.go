@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -77,6 +78,10 @@ func (c *wrapClientConn) peekHTTP() bool {
 	defer func() { _ = c.Conn.SetReadDeadline(time.Time{}) }()
 	buf, err := c.r.Peek(8)
 	if err != nil {
+		// bufio 会把这次读错误记下来，后续 Read 会一直返回它（粘滞）。若不重置，
+		// 后面的 transfer 会立刻"读失败"并关闭连接——服务端先发言的协议因此永远
+		// 收不到 banner（真实目标 22 端口复扫时发现）。
+		c.resetReader()
 		return false
 	}
 	i := strings.IndexByte(string(buf), ' ')
@@ -323,12 +328,29 @@ var errPeekTimeout = errors.New("peek timeout")
 // 立即发出，几百毫秒足够；给太短会误判慢客户端，太长会让 server-first 协议白等。
 const sniffWindow = 300 * time.Millisecond
 
+// resetReader rebuilds the buffered reader after a failed Peek. bufio.Reader caches
+// the error from the failed read and returns it on every later call, so a timed-out
+// sniff would poison the tunnel. Bytes already buffered are preserved.
+func (c *wrapClientConn) resetReader() {
+	n := c.r.Buffered()
+	var prefix []byte
+	if n > 0 {
+		prefix, _ = c.r.Peek(n)
+	}
+	var r io.Reader = c.Conn
+	if len(prefix) > 0 {
+		r = io.MultiReader(bytes.NewReader(prefix), c.Conn)
+	}
+	c.r = bufio.NewReader(r)
+}
+
 // peekWithin peeks n bytes, waiting at most d for the client to send them.
 func peekWithin(wc *wrapClientConn, n int, d time.Duration) ([]byte, error) {
 	_ = wc.Conn.SetReadDeadline(time.Now().Add(d))
 	defer func() { _ = wc.Conn.SetReadDeadline(time.Time{}) }()
 	b, err := wc.Peek(n)
 	if err != nil {
+		wc.resetReader()
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
 			return nil, errPeekTimeout
