@@ -35,6 +35,16 @@ type Proxy struct {
 	shouldIntercept  func(req *http.Request) bool              // req is received by proxy.server
 	upstreamProxy    func(req *http.Request) (*url.URL, error) // req is received by proxy.server, not client request
 	authProxy        func(res http.ResponseWriter, req *http.Request) (bool, error)
+	// policy runs after proxy authentication and before CONNECT/absolute-form
+	// handling. Returning false means the hook has already written the response
+	// (e.g. 403/429) and the connection must be dropped without touching the
+	// target. This is the hook a caller uses to enforce egress policy; authProxy
+	// can only answer 407.
+	policy func(res http.ResponseWriter, req *http.Request) bool
+	// tunnelDone is called when a transparent tunnel closes, with the number of
+	// bytes copied client->server (up) and server->client (down). Callers use it
+	// for per-connection accounting; without it the counts are discarded.
+	tunnelDone func(f *Flow, up, down int64)
 }
 
 // proxy.server req context key
@@ -139,4 +149,18 @@ func (proxy *Proxy) getUpstreamConn(ctx context.Context, req *http.Request) (net
 
 func (proxy *Proxy) SetAuthProxy(fn func(res http.ResponseWriter, req *http.Request) (bool, error)) {
 	proxy.authProxy = fn
+}
+
+// SetPolicy installs the pre-connect policy hook. It runs once per client
+// request (CONNECT or absolute-form) after authentication and before any
+// upstream connection is made. A false return means the hook wrote its own
+// response and the connection is closed.
+func (proxy *Proxy) SetPolicy(fn func(res http.ResponseWriter, req *http.Request) bool) {
+	proxy.policy = fn
+}
+
+// SetTunnelDone installs the tunnel accounting callback: bytes copied
+// client->server and server->client when a transparent tunnel closes.
+func (proxy *Proxy) SetTunnelDone(fn func(f *Flow, up, down int64)) {
+	proxy.tunnelDone = fn
 }

@@ -6,7 +6,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
 	log "github.com/sirupsen/logrus"
@@ -64,6 +66,27 @@ func (c *wrapClientConn) Peek(n int) ([]byte, error) {
 
 func (c *wrapClientConn) PeekBuffered() ([]byte, error) {
 	return c.r.Peek(c.r.Buffered())
+}
+
+// peekHTTP reports whether the tunnel's first bytes look like an HTTP/1.x
+// request line. It never consumes bytes; a client that stays silent past the
+// deadline is treated as a non-HTTP tunnel.
+func (c *wrapClientConn) peekHTTP() bool {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	defer func() { _ = c.Conn.SetReadDeadline(time.Time{}) }()
+	buf, err := c.r.Peek(8)
+	if err != nil {
+		return false
+	}
+	i := strings.IndexByte(string(buf), ' ')
+	if i <= 0 {
+		return false
+	}
+	switch string(buf[:i]) {
+	case "GET", "POST", "PUT", "HEAD", "DELETE", "OPTIONS", "PATCH", "TRACE":
+		return true
+	}
+	return false
 }
 
 func (c *wrapClientConn) Read(data []byte) (int, error) {
@@ -192,6 +215,12 @@ func (e *entry) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	// Pre-connect policy. The hook owns the response when it returns false, so
+	// a rejected request never reaches the target.
+	if e.proxy.policy != nil && !e.proxy.policy(res, req) {
+		log.Errorf("Proxy policy rejected %s %s", req.Method, req.Host)
+		return
+	}
 	// proxy via connect tunnel
 	if req.Method == "CONNECT" {
 		e.handleConnect(res, req)
@@ -290,23 +319,39 @@ func (e *entry) directTransfer(res http.ResponseWriter, req *http.Request, f *Fl
 		"host": req.Host,
 	})
 
+	cconn, err := e.establishConnection(res, f)
+	if err != nil {
+		return
+	}
+
+	// After 200 Connection Established the client starts sending. If it speaks
+	// plaintext HTTP (curl -p, proxychains-ng) the stream belongs in the L7 path,
+	// not in a blind tunnel; serve it through the same http.Server as MITM'd
+	// traffic so addons see method/path/headers/body.
+	if wc, ok := cconn.(*wrapClientConn); ok && wc.peekHTTP() {
+		f.ConnContext.ClientConn.Tls = false
+		proxy.attacker.initHttpDialFn(req)
+		proxy.attacker.servePlain(cconn, f.ConnContext) // takes ownership of cconn
+		return
+	}
+
 	conn, err := proxy.getUpstreamConn(req.Context(), req)
 	if err != nil {
 		for _, addon := range proxy.Addons {
 			addon.HTTPConnectError(f, err)
 		}
-		res.WriteHeader(502)
+		// already hijacked: res is unusable, answer on the raw conn
+		_, _ = io.WriteString(cconn, "HTTP/1.1 502 Bad Gateway"+string([]byte{13, 10, 13, 10}))
+		cconn.Close()
 		return
 	}
 	defer conn.Close()
-
-	cconn, err := e.establishConnection(res, f)
-	if err != nil {
-		return
-	}
 	defer cconn.Close()
 
-	transfer(log, conn, cconn)
+	up, down := transfer(log, conn, cconn)
+	if proxy.tunnelDone != nil {
+		proxy.tunnelDone(f, up, down)
+	}
 }
 
 func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request, f *Flow) {
@@ -366,7 +411,7 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	transfer(log, conn, cconn)
+	_, _ = transfer(log, conn, cconn)
 	cconn.Close()
 	conn.Close()
 }
@@ -429,7 +474,7 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		log.Error(err)
 		return
 	}
-	transfer(log, conn, cconn)
+	_, _ = transfer(log, conn, cconn)
 	conn.Close()
 	cconn.Close()
 }

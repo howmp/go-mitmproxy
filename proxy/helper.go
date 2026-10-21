@@ -37,25 +37,34 @@ func logErr(log *log.Entry, err error) (loged bool) {
 	return
 }
 
-// 转发流量
-func transfer(log *log.Entry, server, client io.ReadWriteCloser) {
+// transfer copies data in both directions and reports how many bytes went
+// client->server (up) and server->client (down). The counts used to be thrown
+// away, which made per-tunnel accounting impossible.
+func transfer(log *log.Entry, server, client io.ReadWriteCloser) (up, down int64) {
+	type copyResult struct {
+		dir string
+		n   int64
+		err error
+	}
 	done := make(chan struct{})
 	defer close(done)
 
-	errChan := make(chan error)
+	resChan := make(chan copyResult, 2)
 	go func() {
-		_, err := io.Copy(server, client)
+		n, err := io.Copy(server, client)
 		log.Debugln("client copy end", err)
 		client.Close()
+		// A client EOF ends the tunnel. Without closing the upstream side the
+		// other direction never returns and the tunnel (with its accounting)
+		// leaks.
+		server.Close()
 		select {
 		case <-done:
-			return
-		case errChan <- err:
-			return
+		case resChan <- copyResult{"up", n, err}:
 		}
 	}()
 	go func() {
-		_, err := io.Copy(client, server)
+		n, err := io.Copy(client, server)
 		log.Debugln("server copy end", err)
 		server.Close()
 
@@ -66,18 +75,33 @@ func transfer(log *log.Entry, server, client io.ReadWriteCloser) {
 
 		select {
 		case <-done:
-			return
-		case errChan <- err:
-			return
+		case resChan <- copyResult{"down", n, err}:
 		}
 	}()
 
 	for i := 0; i < 2; i++ {
-		if err := <-errChan; err != nil {
-			logErr(log, err)
-			return // 如果有错误，直接返回
+		res := <-resChan
+		if res.dir == "up" {
+			up = res.n
+		} else {
+			down = res.n
+		}
+		if res.err != nil {
+			logErr(log, res.err)
+			// Drain the other direction so its goroutine does not leak, but keep
+			// the byte counts we already have.
+			for j := i + 1; j < 2; j++ {
+				rest := <-resChan
+				if rest.dir == "up" {
+					up = rest.n
+				} else {
+					down = rest.n
+				}
+			}
+			return up, down
 		}
 	}
+	return up, down
 }
 
 func httpError(w http.ResponseWriter, error string, code int) {

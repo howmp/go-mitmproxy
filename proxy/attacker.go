@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
@@ -75,6 +76,11 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 
 	a.server = &http.Server{
 		Handler: a,
+		// A MITM'd TLS connection that never sends an HTTP request (LDAPS, RDP,
+		// PostgreSQL/MySQL TLS, ...) would otherwise hang forever instead of
+		// failing closed. This bounds the wait: the client gets a 400 and the
+		// connection is closed.
+		ReadHeaderTimeout: 3 * time.Second,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			return context.WithValue(ctx, connContextKey, c.(*attackerConn).connCtx)
 		},
@@ -97,6 +103,14 @@ func newCa(opts *Options) (cert.CA, error) {
 
 func (a *attacker) start() error {
 	return a.server.Serve(a.listener)
+}
+
+// servePlain serves HTTP/1.1 over an already-established plaintext tunnel.
+// No TLS handshake: the bytes go to the same http.Server that serves MITM'd
+// traffic, so addons (policy, accounting, request inspection) behave the same.
+func (a *attacker) servePlain(conn net.Conn, connCtx *ConnContext) {
+	connCtx.ClientConn.NegotiatedProtocol = "http/1.1"
+	a.listener.accept(&attackerConn{Conn: conn, connCtx: connCtx})
 }
 
 func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
@@ -140,7 +154,15 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 
 func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	if req.URL.Scheme == "" {
-		req.URL.Scheme = "https"
+		// Plaintext tunnels are served over the same http.Server, so the
+		// upstream scheme follows the client connection instead of being
+		// hardcoded to https.
+		scheme := "https"
+		if cc, ok := req.Context().Value(connContextKey).(*ConnContext); ok && cc != nil &&
+			cc.ClientConn != nil && !cc.ClientConn.Tls {
+			scheme = "http"
+		}
+		req.URL.Scheme = scheme
 	}
 	if req.URL.Host == "" {
 		req.URL.Host = req.Host
