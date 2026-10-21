@@ -16,6 +16,21 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// drainBody discards up to limit bytes from r, giving up after d. It exists so an
+// early refusal (large upload rejected after the review prefix) does not close the
+// connection with unread request data, which would RST away the response.
+func drainBody(r io.Reader, limit int64, d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.CopyN(io.Discard, r, limit)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+	}
+}
+
 type attackerListener struct {
 	connChan chan net.Conn
 }
@@ -585,7 +600,10 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 				for _, addon := range proxy.Addons {
 					addon.Request(f)
 					if f.Response != nil {
+						// 先把判决写回去，再尽力把剩余正文读掉：直接 close 会因未读数据
+						// 触发 RST，客户端可能连这条 403 都收不到。
 						reply(f.Response, nil)
+						drainBody(reqBody, 8<<20, 3*time.Second)
 						return
 					}
 				}
