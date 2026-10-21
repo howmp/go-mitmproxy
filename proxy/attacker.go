@@ -572,8 +572,25 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		}
 
 		if reqBuf == nil {
-			log.Warnf("request body size >= %v\n", proxy.Opts.StreamLargeBodies)
+			log.Warnf("request body size >= %v", proxy.Opts.StreamLargeBodies)
 			f.Stream = true
+			f.RequestStreamed = true
+			// 大请求体的审查窗口：缓冲前 N 字节，照常触发 Addon.Request，让规则层/限速
+			// 仍能拒绝。缓冲的字节随后与剩余流拼回去，不会丢数据。
+			if proxy.Opts.ReviewBodyLimit > 0 {
+				prefix := make([]byte, proxy.Opts.ReviewBodyLimit)
+				n, _ := io.ReadFull(reqBody, prefix)
+				prefix = prefix[:n]
+				f.Request.Body = prefix
+				for _, addon := range proxy.Addons {
+					addon.Request(f)
+					if f.Response != nil {
+						reply(f.Response, nil)
+						return
+					}
+				}
+				reqBody = io.MultiReader(bytes.NewReader(prefix), reqBody)
+			}
 		} else {
 			f.Request.Body = reqBuf
 

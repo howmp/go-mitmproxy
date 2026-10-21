@@ -18,11 +18,16 @@ type Options struct {
 	Debug             int
 	Addr              string
 	StreamLargeBodies int64 // 当请求或响应体大于此字节时，转为 stream 模式
-	SslInsecure       bool
-	CaRootPath        string
-	NewCaFunc         func() (cert.CA, error) //创建 Ca 的函数
-	Upstream          string
-	LogFilePath       string // Path to write logs to file
+	// ReviewBodyLimit enables request-body review for streamed uploads: before
+	// forwarding, the proxy buffers up to this many leading bytes, sets them as
+	// Request.Body and fires Addon.Request, so a large POST can still be inspected
+	// (and refused) even though its full body is never buffered. 0 = disabled.
+	ReviewBodyLimit int
+	SslInsecure     bool
+	CaRootPath      string
+	NewCaFunc       func() (cert.CA, error) //创建 Ca 的函数
+	Upstream        string
+	LogFilePath     string // Path to write logs to file
 }
 
 type Proxy struct {

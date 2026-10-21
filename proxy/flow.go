@@ -115,7 +115,11 @@ type Flow struct {
 
 	// https://docs.mitmproxy.org/stable/overview-features/#streaming
 	// 如果为 true，则不缓冲 Request.Body 和 Response.Body，且不进入之后的 Addon.Request 和 Addon.Response
-	Stream            bool
+	Stream bool
+	// RequestStreamed marks a request whose body was not fully buffered. Request.Body
+	// then holds only the reviewed prefix (see Options.ReviewBodyLimit), so evidence
+	// must record the length as unknown rather than len(Request.Body).
+	RequestStreamed   bool
 	UseSeparateClient bool // use separate http client to send http request
 	StartTime         time.Time
 	done              chan struct{}
@@ -155,7 +159,7 @@ type WebSocketMessage struct {
 func (m *WebSocketMessage) MarshalJSON() ([]byte, error) {
 	typeAlias := struct {
 		Type       int    `json:"type"`
-		Content    string `json:"content"`    // base64 encoded
+		Content    string `json:"content"` // base64 encoded
 		FromClient bool   `json:"fromClient"`
 		Timestamp  string `json:"timestamp"`
 	}{
@@ -197,12 +201,12 @@ func (wsData *WebSocketData) addMessage(msgType int, content []byte, fromClient 
 
 // SSEEvent represents a single Server-Sent Event
 type SSEEvent struct {
-	ID      string    `json:"id,omitempty"`      // event id
-	Event   string    `json:"event,omitempty"`   // event type (default: "message")
-	Data    string    `json:"data"`              // event data
-	Retry   int       `json:"retry,omitempty"`   // retry interval in milliseconds
-	Raw     string    `json:"raw"`               // raw event text
-	Time    time.Time `json:"timestamp"`         // when this event was received
+	ID    string    `json:"id,omitempty"`    // event id
+	Event string    `json:"event,omitempty"` // event type (default: "message")
+	Data  string    `json:"data"`            // event data
+	Retry int       `json:"retry,omitempty"` // retry interval in milliseconds
+	Raw   string    `json:"raw"`             // raw event text
+	Time  time.Time `json:"timestamp"`       // when this event was received
 }
 
 // SSEData holds all SSE events for a flow
@@ -223,4 +227,3 @@ func (sseData *SSEData) addEvent(event *SSEEvent) {
 	defer sseData.mu.Unlock()
 	sseData.Events = append(sseData.Events, event)
 }
-

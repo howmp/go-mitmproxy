@@ -310,3 +310,61 @@ func TestTunnelByteBudget(t *testing.T) {
 		t.Fatalf("bytes %d+%d far beyond the 256-byte budget", up, down)
 	}
 }
+
+// 大请求体（> StreamLargeBodies）仍要经过 Addon.Request 的审查：ReviewBodyLimit
+// 缓冲前缀并触发审查，拒绝时不应把请求转给上游。
+func TestLargeRequestBodyReviewed(t *testing.T) {
+	var hits int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+
+	addr := freeAddr(t)
+	p, err := NewProxy(&Options{
+		Addr: addr, SslInsecure: true, CaRootPath: t.TempDir(),
+		StreamLargeBodies: 1024, ReviewBodyLimit: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addon := &reviewAddon{deny: "union select"}
+	p.AddAddon(addon)
+	go func() { _ = p.Start() }()
+	time.Sleep(100 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	body := strings.Repeat("a", 2048) + " union select password " + strings.Repeat("b", 4096)
+	req := "POST http://" + strings.TrimPrefix(target.URL, "http://") + "/upload HTTP/1.1" + crlf +
+		"Host: " + strings.TrimPrefix(target.URL, "http://") + crlf +
+		"Content-Length: " + fmt.Sprint(len(body)) + crlf +
+		"Connection: close" + crlf + crlf + body
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, _ := br.ReadString(lf)
+	if !strings.Contains(line, "403") {
+		t.Fatalf("status = %q, want 403", line)
+	}
+	if atomic.LoadInt64(&hits) != 0 {
+		t.Fatalf("target received the blocked request %d times", hits)
+	}
+}
+
+type reviewAddon struct {
+	BaseAddon
+	deny string
+}
+
+func (a *reviewAddon) Request(f *Flow) {
+	if strings.Contains(string(f.Request.Body), a.deny) {
+		f.Response = &Response{StatusCode: 403, Header: http.Header{}, Body: []byte("blocked")}
+	}
+}
