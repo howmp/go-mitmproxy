@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -312,6 +313,31 @@ func (e *entry) establishConnection(res http.ResponseWriter, f *Flow) (net.Conn,
 	return cconn, nil
 }
 
+// errPeekTimeout marks "the client sent nothing within the sniff window". That is
+// the normal shape of a server-first protocol (SSH/SMTP/MySQL banner, FTP, ...): it
+// is not TLS (TLS always starts with a client ClientHello) and it must not be held
+// back waiting for client bytes, or a probe that only listens never sees the banner.
+var errPeekTimeout = errors.New("peek timeout")
+
+// sniffWindow 是"客户端是否会先说话"的判定窗口。TLS 的 ClientHello 在连接建立后
+// 立即发出，几百毫秒足够；给太短会误判慢客户端，太长会让 server-first 协议白等。
+const sniffWindow = 300 * time.Millisecond
+
+// peekWithin peeks n bytes, waiting at most d for the client to send them.
+func peekWithin(wc *wrapClientConn, n int, d time.Duration) ([]byte, error) {
+	_ = wc.Conn.SetReadDeadline(time.Now().Add(d))
+	defer func() { _ = wc.Conn.SetReadDeadline(time.Time{}) }()
+	b, err := wc.Peek(n)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, errPeekTimeout
+		}
+		return nil, err
+	}
+	return b, nil
+}
+
 func (e *entry) directTransfer(res http.ResponseWriter, req *http.Request, f *Flow) {
 	proxy := e.proxy
 	log := log.WithFields(log.Fields{
@@ -376,7 +402,18 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	peek, err := cconn.(*wrapClientConn).Peek(3)
+	wcFA, _ := cconn.(*wrapClientConn)
+	peek, err := peekWithin(wcFA, 3, sniffWindow)
+	if err == errPeekTimeout {
+		// 服务端先发言（SSH/SMTP/...）：上游已拨好，直接透传。
+		defer conn.Close()
+		defer cconn.Close()
+		up, down := transfer(log, conn, cconn)
+		if proxy.tunnelDone != nil {
+			proxy.tunnelDone(f, up, down)
+		}
+		return
+	}
 	if err != nil {
 		cconn.Close()
 		conn.Close()
@@ -444,7 +481,24 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		return
 	}
 
-	peek, err := cconn.(*wrapClientConn).Peek(3)
+	wc, _ := cconn.(*wrapClientConn)
+	peek, err := peekWithin(wc, 3, sniffWindow)
+	if err == errPeekTimeout {
+		// 服务端先发言：不能等客户端。直接拨上游并透传，否则 NULL 探针看不到 banner。
+		conn, derr := proxy.attacker.httpsDial(req.Context(), req)
+		if derr != nil {
+			cconn.Close()
+			log.Error(derr)
+			return
+		}
+		defer conn.Close()
+		defer cconn.Close()
+		up, down := transfer(log, conn, cconn)
+		if proxy.tunnelDone != nil {
+			proxy.tunnelDone(f, up, down)
+		}
+		return
+	}
 	if err != nil {
 		cconn.Close()
 		log.Error(err)

@@ -205,3 +205,43 @@ func TestPlainHTTPWithInterceptEnabled(t *testing.T) {
 		t.Fatalf("addon did not see the L7 request (plaintext tunneled?): %q", got)
 	}
 }
+
+// 服务端先发言的协议（SSH/SMTP/MySQL banner）：客户端连上不发任何字节。
+// 拦截路径必须在一个短窗口后判定为"非 TLS 隧道"并立即拨上游，否则只监听不发包的
+// NULL 探针永远看不到 banner——端口扫描会把 22 判成未知（2026-10 实测发现）。
+func TestServerFirstProtocolTunnel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// banner 立刻发出，然后等客户端
+			_, _ = c.Write([]byte("SSH-2.0-OpenSSH_9.6\r\n"))
+			go func() {
+				buf := make([]byte, 64)
+				_, _ = c.Read(buf)
+				c.Close()
+			}()
+		}
+	}()
+
+	p, addr := startProxy(t)
+	defer p.Close()
+	// 默认拦截（生产配置）——这正是出问题的路径
+	c, br := connect(t, addr, ln.Addr().String())
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	line, err := br.ReadString(lf)
+	if err != nil {
+		t.Fatalf("server-first banner not delivered: %v", err)
+	}
+	if !strings.HasPrefix(line, "SSH-2.0-OpenSSH") {
+		t.Fatalf("banner = %q", line)
+	}
+}
