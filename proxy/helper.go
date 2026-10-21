@@ -79,7 +79,8 @@ func (b *budgetReader) Read(p []byte) (int, error) {
 // maxBytes caps the sum of both directions (0 = unlimited); maxDur caps the
 // tunnel lifetime (0 = unlimited). Both are enforced here because this is the
 // only place that sees the bytes as they flow.
-func transfer(log *log.Entry, server, client io.ReadWriteCloser, maxBytes int64, maxDur time.Duration) transferStats {
+func transfer(log *log.Entry, server, client io.ReadWriteCloser, budget TunnelBudget) transferStats {
+	maxBytes, maxDur := budget.MaxBytes, budget.MaxDur
 	start := time.Now()
 	if maxDur > 0 {
 		deadline := start.Add(maxDur)
@@ -91,10 +92,45 @@ func transfer(log *log.Entry, server, client io.ReadWriteCloser, maxBytes int64,
 		}
 	}
 	var used int64
+	// failClosed flips when the app reports the policy source unavailable; after
+	// that the tunnel gets an idle deadline (refreshed by activity) and is closed
+	// with terminated=fail_closed.
+	var failClosed atomic.Bool
+	guardDone := make(chan struct{})
+	defer close(guardDone)
+	if budget.Abort != nil {
+		go func() {
+			t := time.NewTicker(500 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-guardDone:
+					return
+				case <-t.C:
+					if budget.Abort() {
+						failClosed.Store(true)
+						idle := budget.Idle
+						if idle <= 0 {
+							idle = 60 * time.Second
+						}
+						dl := time.Now().Add(idle)
+						if c, ok := server.(net.Conn); ok {
+							_ = c.SetReadDeadline(dl)
+						}
+						if c, ok := client.(net.Conn); ok {
+							_ = c.SetReadDeadline(dl)
+						}
+						return
+					}
+				}
+			}
+		}()
+	}
 	var src io.Reader = client
 	if maxBytes > 0 {
 		src = &budgetReader{r: client, used: &used, limit: maxBytes}
 	}
+	src = &guardReader{r: src, conn: connOf(client), idle: budget.Idle, closed: &failClosed}
 	var dstW io.Writer = client
 	type copyResult struct {
 		dir string
@@ -123,6 +159,7 @@ func transfer(log *log.Entry, server, client io.ReadWriteCloser, maxBytes int64,
 		if maxBytes > 0 {
 			r = &budgetReader{r: server, used: &used, limit: maxBytes}
 		}
+		r = &guardReader{r: r, conn: connOf(server), idle: budget.Idle, closed: &failClosed}
 		n, err := io.Copy(dstW, r)
 		log.Debugln("server copy end", err)
 		server.Close()
@@ -145,6 +182,7 @@ func transfer(log *log.Entry, server, client io.ReadWriteCloser, maxBytes int64,
 
 	stats := transferStats{Terminated: "closed"}
 	budgetHit := false
+	policyCut := false
 	for i := 0; i < 2; i++ {
 		res := <-resChan
 		if res.dir == "up" {
@@ -155,6 +193,10 @@ func transfer(log *log.Entry, server, client io.ReadWriteCloser, maxBytes int64,
 		if res.err != nil {
 			if errors.Is(res.err, errTunnelBudget) {
 				budgetHit = true
+				continue
+			}
+			if failClosed.Load() {
+				policyCut = true
 				continue
 			}
 			var ne net.Error
@@ -179,8 +221,39 @@ func transfer(log *log.Entry, server, client io.ReadWriteCloser, maxBytes int64,
 	if budgetHit {
 		stats.Terminated = "budget_bytes"
 	}
+	if policyCut {
+		stats.Terminated = "fail_closed"
+	}
 	stats.Duration = time.Since(start)
 	return stats
+}
+
+// guardReader refreshes the idle deadline on every read once the policy source is
+// gone: an active tunnel stays alive, an idle one hits the deadline and closes.
+type guardReader struct {
+	r      io.Reader
+	conn   net.Conn
+	idle   time.Duration
+	closed *atomic.Bool
+}
+
+func (g *guardReader) Read(p []byte) (int, error) {
+	if g.conn != nil && g.closed != nil && g.closed.Load() {
+		idle := g.idle
+		if idle <= 0 {
+			idle = 60 * time.Second
+		}
+		_ = g.conn.SetReadDeadline(time.Now().Add(idle))
+	}
+	return g.r.Read(p)
+}
+
+// connOf returns the net.Conn underneath a reader/writer when there is one.
+func connOf(v any) net.Conn {
+	if c, ok := v.(net.Conn); ok {
+		return c
+	}
+	return nil
 }
 
 func httpError(w http.ResponseWriter, error string, code int) {

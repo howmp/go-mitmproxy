@@ -51,10 +51,9 @@ type Proxy struct {
 	// bytes copied client->server (up) and server->client (down), how long it
 	// lived and why it ended (closed / budget_bytes / budget_duration / error).
 	tunnelDone func(f *Flow, up, down int64, dur time.Duration, terminated string)
-	// tunnelBudget returns per-tunnel limits: maxBytes caps the sum of both
-	// directions (0 = unlimited), maxDur caps lifetime (0 = unlimited). The
-	// caller enforces per-exec budgets; transfer() applies them.
-	tunnelBudget func(f *Flow) (maxBytes int64, maxDur time.Duration)
+	// tunnelBudget returns per-tunnel limits and the fail-closed guard. The caller
+	// enforces per-exec budgets; transfer() applies them.
+	tunnelBudget func(f *Flow) TunnelBudget
 }
 
 // proxy.server req context key
@@ -175,8 +174,20 @@ func (proxy *Proxy) SetTunnelDone(fn func(f *Flow, up, down int64, dur time.Dura
 	proxy.tunnelDone = fn
 }
 
+// TunnelBudget is the per-tunnel policy: byte/duration caps plus the fail-closed
+// guard. MaxBytes/MaxDur follow the per-exec budget. Idle/Abort implement §2.5.2:
+// once Abort() reports true (policy source unavailable), the tunnel is closed
+// after Idle of inactivity; active traffic keeps it alive by refreshing the
+// deadline on every read.
+type TunnelBudget struct {
+	MaxBytes int64
+	MaxDur   time.Duration
+	Idle     time.Duration
+	Abort    func() bool
+}
+
 // SetTunnelBudget installs the per-tunnel limit hook. It is consulted once, when
 // the tunnel starts; transfer() enforces the values it returns.
-func (proxy *Proxy) SetTunnelBudget(fn func(f *Flow) (maxBytes int64, maxDur time.Duration)) {
+func (proxy *Proxy) SetTunnelBudget(fn func(f *Flow) TunnelBudget) {
 	proxy.tunnelBudget = fn
 }

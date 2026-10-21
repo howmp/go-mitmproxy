@@ -276,7 +276,7 @@ func TestTunnelByteBudget(t *testing.T) {
 		down   int64
 		reason string
 	)
-	p.SetTunnelBudget(func(*Flow) (int64, time.Duration) { return 256, 0 })
+	p.SetTunnelBudget(func(*Flow) TunnelBudget { return TunnelBudget{MaxBytes: 256} })
 	p.SetTunnelDone(func(_ *Flow, u, d int64, _ time.Duration, term string) {
 		mu.Lock()
 		up, down, reason = u, d, term
@@ -366,5 +366,75 @@ type reviewAddon struct {
 func (a *reviewAddon) Request(f *Flow) {
 	if strings.Contains(string(f.Request.Body), a.deny) {
 		f.Response = &Response{StatusCode: 403, Header: http.Header{}, Body: []byte("blocked")}
+	}
+}
+
+// 策略源不可用时，隧道在空闲窗口后必须被切断并上报 fail_closed（§2.5.2）。
+func TestTunnelFailClosedOnIdle(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
+		}
+	}()
+
+	addr := freeAddr(t)
+	p, err := NewProxy(&Options{Addr: addr, SslInsecure: true, CaRootPath: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aborted atomic.Bool
+	var (
+		mu     sync.Mutex
+		reason string
+	)
+	p.SetTunnelBudget(func(*Flow) TunnelBudget {
+		return TunnelBudget{
+			Idle:  150 * time.Millisecond,
+			Abort: func() bool { return aborted.Load() },
+		}
+	})
+	p.SetTunnelDone(func(_ *Flow, _, _ int64, _ time.Duration, term string) {
+		mu.Lock()
+		reason = term
+		mu.Unlock()
+	})
+	go func() { _ = p.Start() }()
+	time.Sleep(100 * time.Millisecond)
+
+	conn, br := connect(t, addr, ln.Addr().String())
+	defer conn.Close()
+	// 先确认隧道是活的（回显一次），再让它空闲。
+	_, _ = conn.Write([]byte("ping"))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(br, buf); err != nil {
+		t.Fatalf("echo: %v", err)
+	}
+	aborted.Store(true)
+
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		mu.Lock()
+		r := reason
+		mu.Unlock()
+		if r != "" {
+			if r != "fail_closed" {
+				t.Fatalf("terminated = %q, want fail_closed", r)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tunnel was not cut after policy became unavailable")
+		}
+		time.Sleep(30 * time.Millisecond)
 	}
 }

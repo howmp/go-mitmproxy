@@ -360,18 +360,17 @@ func peekWithin(wc *wrapClientConn, n int, d time.Duration) ([]byte, error) {
 	return b, nil
 }
 
-// tunnelLimits asks the app for this tunnel's budgets (0 = unlimited).
-func (e *entry) tunnelLimits(f *Flow) (int64, time.Duration) {
+// tunnelBudget asks the app for this tunnel's budgets and fail-closed guard.
+func (e *entry) tunnelBudget(f *Flow) TunnelBudget {
 	if e.proxy.tunnelBudget == nil {
-		return 0, 0
+		return TunnelBudget{}
 	}
 	return e.proxy.tunnelBudget(f)
 }
 
 // runTunnel transfers the tunnel with the app's budgets and reports stats.
 func (e *entry) runTunnel(log *log.Entry, server, client io.ReadWriteCloser, f *Flow) transferStats {
-	maxBytes, maxDur := e.tunnelLimits(f)
-	st := transfer(log, server, client, maxBytes, maxDur)
+	st := transfer(log, server, client, e.tunnelBudget(f))
 	if e.proxy.tunnelDone != nil {
 		e.proxy.tunnelDone(f, st.Up, st.Down, st.Duration, st.Terminated)
 	}
