@@ -206,8 +206,13 @@ func (a *attacker) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 func (a *attacker) initHttpDialFn(req *http.Request) {
 	connCtx := req.Context().Value(connContextKey).(*ConnContext)
 	connCtx.dialFn = func(ctx context.Context) error {
+		// 明文 CONNECT 的上游拨号与"客户端请求上下文"无关：该请求是在 hijack 之后由
+		// 内层 http.Server 派生的，其 ctx 在 CONNECT 处理返回时会被取消，直接用会得到
+		// "operation was canceled"。这里脱钩，只保留 10s 拨号上限。
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer dcancel()
 		addr := helper.CanonicalAddr(req.URL)
-		c, err := a.proxy.getUpstreamConn(ctx, req)
+		c, err := a.proxy.getUpstreamConn(dctx, req)
 		if err != nil {
 			return err
 		}
@@ -588,7 +593,16 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		reqBody = addon.StreamRequestModifier(f, reqBody)
 	}
 
-	proxyReqCtx := context.WithValue(req.Context(), proxyReqCtxKey, req)
+	// 明文 CONNECT 分支的请求由内层 http.Server 服务，而外层 CONNECT 处理一返回就会
+	// 取消它那条请求上下文——直接用会把上游请求也一起取消（表现为 502 + context
+	// canceled）。这里脱钩，用 120s 上限兜底；客户端断连由写失败感知。
+	baseCtx := req.Context()
+	if f.ConnContext != nil && !f.ConnContext.ClientConn.Tls {
+		var cancel context.CancelFunc
+		baseCtx, cancel = context.WithTimeout(context.WithoutCancel(baseCtx), 120*time.Second)
+		_ = cancel // 由 timeout 自己回收；请求结束时释放连接
+	}
+	proxyReqCtx := context.WithValue(baseCtx, proxyReqCtxKey, req)
 	proxyReq, err := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), reqBody)
 	if err != nil {
 		for _, addon := range proxy.Addons {

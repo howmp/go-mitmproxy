@@ -411,6 +411,21 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		return
 	}
 
+	// Plaintext HTTP over CONNECT (curl -p, proxychains, a plain HTTP probe): serve it
+	// through the same http.Server as MITM'd traffic so addons see method/path/body.
+	// The upstream conn dialed for the TLS attempt must be dropped first, otherwise
+	// this branch would keep bypassing every addon.
+	if wc, ok := cconn.(*wrapClientConn); ok && wc.peekHTTP() {
+		conn.Close()
+		// 上面为 TLS 尝试拨过的上游连接已关闭，但它把 ServerConn 挂在了 ConnContext 上；
+		// 不清掉的话 attack() 会复用这条已关闭的连接（表现为 200 + 空 body）。
+		f.ConnContext.ServerConn = nil
+		f.ConnContext.ClientConn.Tls = false
+		proxy.attacker.initHttpDialFn(req)
+		proxy.attacker.servePlain(cconn, f.ConnContext) // takes ownership of cconn
+		return
+	}
+
 	_, _ = transfer(log, conn, cconn)
 	cconn.Close()
 	conn.Close()
@@ -474,6 +489,20 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		log.Error(err)
 		return
 	}
+	// Plaintext HTTP over CONNECT (curl -p, proxychains, a plain HTTP probe): serve it
+	// through the same http.Server as MITM'd traffic so addons see method/path/body.
+	// No upstream conn is open yet on this path.
+	if wc, ok := cconn.(*wrapClientConn); ok && wc.peekHTTP() {
+		conn.Close()
+		// 上面为 TLS 尝试拨过的上游连接已关闭，但它把 ServerConn 挂在了 ConnContext 上；
+		// 不清掉的话 attack() 会复用这条已关闭的连接（表现为 200 + 空 body）。
+		f.ConnContext.ServerConn = nil
+		f.ConnContext.ClientConn.Tls = false
+		proxy.attacker.initHttpDialFn(req)
+		proxy.attacker.servePlain(cconn, f.ConnContext) // takes ownership of cconn
+		return
+	}
+
 	_, _ = transfer(log, conn, cconn)
 	conn.Close()
 	cconn.Close()

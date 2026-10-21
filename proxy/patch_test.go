@@ -30,10 +30,17 @@ func freeAddr(t *testing.T) string {
 type recAddon struct {
 	BaseAddon
 	seen atomic.Value
+	t    *testing.T
 }
 
 func (a *recAddon) Request(f *Flow) {
 	a.seen.Store(f.Request.Method + " " + f.Request.URL.Path)
+}
+
+func (a *recAddon) RequestError(f *Flow, err error) {
+	if a.t != nil {
+		a.t.Logf("RequestError: %v", err)
+	}
 }
 
 func startProxy(t *testing.T) (*Proxy, string) {
@@ -111,7 +118,7 @@ func TestPlainHTTPOverConnect(t *testing.T) {
 	p, addr := startProxy(t)
 	defer p.Close()
 	p.SetShouldInterceptRule(func(*http.Request) bool { return false })
-	rec := &recAddon{}
+	rec := &recAddon{t: t}
 	p.AddAddon(rec)
 
 	c, br := connect(t, addr, th)
@@ -164,5 +171,37 @@ func TestTunnelByteAccounting(t *testing.T) {
 	}
 	if up < 10 || down < 10 {
 		t.Fatalf("tunnel bytes not accounted: up=%d down=%d", up, down)
+	}
+}
+
+// CONNECT 后的明文 HTTP 在**默认拦截开启**时也必须进 L7。
+// 之前的实现只在 shouldIntercept=false（directTransfer）路径上嗅探；拦截开启时
+// 明文被当盲隧道，扫描器/curl -p 的请求既不审查也不记录——2026-10 用真实内网
+// 目标复扫时发现（一轮 300 个端口只留 1 条证据）。
+func TestPlainHTTPWithInterceptEnabled(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello-intercept")
+	}))
+	defer target.Close()
+	th := strings.TrimPrefix(target.URL, "http://")
+
+	p, addr := startProxy(t)
+	defer p.Close()
+	// 不调用 SetShouldInterceptRule：默认拦截（生产配置）
+	rec := &recAddon{t: t}
+	p.AddAddon(rec)
+
+	c, br := connect(t, addr, th)
+	defer c.Close()
+	fmt.Fprintf(c, "GET /plain HTTP/1.1%sHost: %s%sConnection: close%s%s", crlf, th, crlf, crlf, crlf)
+	body, err := io.ReadAll(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "hello-intercept") {
+		t.Fatalf("body not proxied: %q", string(body))
+	}
+	if got, _ := rec.seen.Load().(string); got != "GET /plain" {
+		t.Fatalf("addon did not see the L7 request (plaintext tunneled?): %q", got)
 	}
 }
