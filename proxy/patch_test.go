@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,7 +158,7 @@ func TestTunnelByteAccounting(t *testing.T) {
 	defer p.Close()
 	p.SetShouldInterceptRule(func(*http.Request) bool { return false })
 	var up, down int64
-	p.SetTunnelDone(func(f *Flow, u, d int64) { up = u; down = d })
+	p.SetTunnelDone(func(f *Flow, u, d int64, _ time.Duration, _ string) { up = u; down = d })
 
 	c, br := connect(t, addr, l.Addr().String())
 	fmt.Fprintf(c, "SSH-2.0-protocol-test%s", crlf)
@@ -243,5 +244,69 @@ func TestServerFirstProtocolTunnel(t *testing.T) {
 	}
 	if !strings.HasPrefix(line, "SSH-2.0-OpenSSH") {
 		t.Fatalf("banner = %q", line)
+	}
+}
+
+// 隧道字节预算：超过上限必须断连并上报 terminated=budget_bytes，不能静默半开。
+func TestTunnelByteBudget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// 服务端先发言，且一次写满 4KB，必然超过 256 字节预算。
+		_, _ = c.Write(make([]byte, 4096))
+		time.Sleep(2 * time.Second)
+	}()
+
+	addr := freeAddr(t)
+	p, err := NewProxy(&Options{Addr: addr, SslInsecure: true, CaRootPath: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu     sync.Mutex
+		up     int64
+		down   int64
+		reason string
+	)
+	p.SetTunnelBudget(func(*Flow) (int64, time.Duration) { return 256, 0 })
+	p.SetTunnelDone(func(_ *Flow, u, d int64, _ time.Duration, term string) {
+		mu.Lock()
+		up, down, reason = u, d, term
+		mu.Unlock()
+	})
+	go func() { _ = p.Start() }()
+	time.Sleep(100 * time.Millisecond)
+
+	c, br := connect(t, addr, ln.Addr().String())
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 64)
+	_, _ = br.Read(buf)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		r := reason
+		mu.Unlock()
+		if r != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reason != "budget_bytes" {
+		t.Fatalf("terminated = %q, want budget_bytes", reason)
+	}
+	if up+down > 256+4096 {
+		t.Fatalf("bytes %d+%d far beyond the 256-byte budget", up, down)
 	}
 }

@@ -360,6 +360,24 @@ func peekWithin(wc *wrapClientConn, n int, d time.Duration) ([]byte, error) {
 	return b, nil
 }
 
+// tunnelLimits asks the app for this tunnel's budgets (0 = unlimited).
+func (e *entry) tunnelLimits(f *Flow) (int64, time.Duration) {
+	if e.proxy.tunnelBudget == nil {
+		return 0, 0
+	}
+	return e.proxy.tunnelBudget(f)
+}
+
+// runTunnel transfers the tunnel with the app's budgets and reports stats.
+func (e *entry) runTunnel(log *log.Entry, server, client io.ReadWriteCloser, f *Flow) transferStats {
+	maxBytes, maxDur := e.tunnelLimits(f)
+	st := transfer(log, server, client, maxBytes, maxDur)
+	if e.proxy.tunnelDone != nil {
+		e.proxy.tunnelDone(f, st.Up, st.Down, st.Duration, st.Terminated)
+	}
+	return st
+}
+
 func (e *entry) directTransfer(res http.ResponseWriter, req *http.Request, f *Flow) {
 	proxy := e.proxy
 	log := log.WithFields(log.Fields{
@@ -396,10 +414,7 @@ func (e *entry) directTransfer(res http.ResponseWriter, req *http.Request, f *Fl
 	defer conn.Close()
 	defer cconn.Close()
 
-	up, down := transfer(log, conn, cconn)
-	if proxy.tunnelDone != nil {
-		proxy.tunnelDone(f, up, down)
-	}
+	e.runTunnel(log, conn, cconn, f)
 }
 
 func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request, f *Flow) {
@@ -430,10 +445,7 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		// 服务端先发言（SSH/SMTP/...）：上游已拨好，直接透传。
 		defer conn.Close()
 		defer cconn.Close()
-		up, down := transfer(log, conn, cconn)
-		if proxy.tunnelDone != nil {
-			proxy.tunnelDone(f, up, down)
-		}
+		e.runTunnel(log, conn, cconn, f)
 		return
 	}
 	if err != nil {
@@ -485,7 +497,7 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	_, _ = transfer(log, conn, cconn)
+	e.runTunnel(log, conn, cconn, f)
 	cconn.Close()
 	conn.Close()
 }
@@ -518,10 +530,7 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		}
 		defer conn.Close()
 		defer cconn.Close()
-		up, down := transfer(log, conn, cconn)
-		if proxy.tunnelDone != nil {
-			proxy.tunnelDone(f, up, down)
-		}
+		e.runTunnel(log, conn, cconn, f)
 		return
 	}
 	if err != nil {
@@ -582,7 +591,7 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		return
 	}
 
-	_, _ = transfer(log, conn, cconn)
+	e.runTunnel(log, conn, cconn, f)
 	conn.Close()
 	cconn.Close()
 }

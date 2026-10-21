@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
@@ -42,9 +43,13 @@ type Proxy struct {
 	// can only answer 407.
 	policy func(res http.ResponseWriter, req *http.Request) bool
 	// tunnelDone is called when a transparent tunnel closes, with the number of
-	// bytes copied client->server (up) and server->client (down). Callers use it
-	// for per-connection accounting; without it the counts are discarded.
-	tunnelDone func(f *Flow, up, down int64)
+	// bytes copied client->server (up) and server->client (down), how long it
+	// lived and why it ended (closed / budget_bytes / budget_duration / error).
+	tunnelDone func(f *Flow, up, down int64, dur time.Duration, terminated string)
+	// tunnelBudget returns per-tunnel limits: maxBytes caps the sum of both
+	// directions (0 = unlimited), maxDur caps lifetime (0 = unlimited). The
+	// caller enforces per-exec budgets; transfer() applies them.
+	tunnelBudget func(f *Flow) (maxBytes int64, maxDur time.Duration)
 }
 
 // proxy.server req context key
@@ -161,6 +166,12 @@ func (proxy *Proxy) SetPolicy(fn func(res http.ResponseWriter, req *http.Request
 
 // SetTunnelDone installs the tunnel accounting callback: bytes copied
 // client->server and server->client when a transparent tunnel closes.
-func (proxy *Proxy) SetTunnelDone(fn func(f *Flow, up, down int64)) {
+func (proxy *Proxy) SetTunnelDone(fn func(f *Flow, up, down int64, dur time.Duration, terminated string)) {
 	proxy.tunnelDone = fn
+}
+
+// SetTunnelBudget installs the per-tunnel limit hook. It is consulted once, when
+// the tunnel starts; transfer() enforces the values it returns.
+func (proxy *Proxy) SetTunnelBudget(fn func(f *Flow) (maxBytes int64, maxDur time.Duration)) {
+	proxy.tunnelBudget = fn
 }
